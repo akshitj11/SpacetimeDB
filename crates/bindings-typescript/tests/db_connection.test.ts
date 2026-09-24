@@ -213,6 +213,83 @@ describe('DbConnection', () => {
     expect(client.isActive).toBe(false);
   });
 
+  test('reports a server message it cannot apply through onDisconnect instead of throwing', async () => {
+    const onDisconnectPromise = new Deferred<Error | undefined>();
+    const wsAdapter = new WebsocketTestAdapter();
+
+    const client = DbConnection.builder()
+      .withUri('ws://127.0.0.1:1234')
+      .withDatabaseName('db')
+      .withWSFn(wsAdapter.openWebSocket)
+      .onConnect(() => {
+        throw new Error('callback failed');
+      })
+      .onDisconnect((_ctx, error) => onDisconnectPromise.resolve(error))
+      .build();
+
+    await client['wsPromise'];
+    wsAdapter.acceptConnection();
+    // Node rethrows errors from WebSocket listeners on the next tick, which
+    // crashes the host process.
+    expect(() =>
+      wsAdapter.sendToClient(
+        ServerMessage.InitialConnection({
+          identity: anIdentity,
+          token: 'a-token',
+          connectionId: ConnectionId.random(),
+        })
+      )
+    ).not.toThrow();
+
+    expect((await onDisconnectPromise.promise)?.message).toBe(
+      'callback failed'
+    );
+    expect(client.isActive).toBe(false);
+  });
+
+  test('reports a row it cannot decode through onDisconnect instead of throwing', async () => {
+    const onDisconnectPromise = new Deferred<Error | undefined>();
+    const wsAdapter = new WebsocketTestAdapter();
+
+    const client = DbConnection.builder()
+      .withUri('ws://127.0.0.1:1234')
+      .withDatabaseName('db')
+      .withWSFn(wsAdapter.openWebSocket)
+      .onDisconnect((_ctx, error) => onDisconnectPromise.resolve(error))
+      .build();
+
+    await client['wsPromise'];
+    wsAdapter.acceptConnection();
+    wsAdapter.sendToClient(
+      ServerMessage.InitialConnection({
+        identity: anIdentity,
+        token: 'a-token',
+        connectionId: ConnectionId.random(),
+      })
+    );
+    expect(client.isActive).toBe(true);
+
+    // A `player` row one byte short, as when the client's bindings are out of
+    // step with the module's schema.
+    const truncatedPlayer = encodePlayer({
+      id: 1,
+      userId: anIdentity,
+      name: 'drogus',
+      location: { x: 0, y: 0 },
+    }).slice(0, -1);
+    expect(() =>
+      wsAdapter.sendToClient(
+        ServerMessage.TransactionUpdate({
+          querySets: [makeQuerySetUpdate(0, 'player', truncatedPlayer)],
+        })
+      )
+    ).not.toThrow();
+
+    expect(await onDisconnectPromise.promise).toBeInstanceOf(RangeError);
+    expect(client.isActive).toBe(false);
+    expect(wsAdapter.closed).toBe(true);
+  });
+
   test('marks disconnect as requested when disconnect() is called', async () => {
     const onDisconnectPromise = new Deferred<void>();
     const wsAdapter = new WebsocketTestAdapter();
