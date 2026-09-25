@@ -104,11 +104,13 @@ pub fn eval_delta<'a, Tx: Datastore + DeltaStore>(
 
         for (row, n) in insert_counts.into_iter().filter(|(_, n)| *n > 0) {
             duplicate_rows_sent += n as u64 - 1;
-            inserts.extend(std::iter::repeat_n(row, n));
+            let row = row.to_product_value();
+            inserts.extend((0..n).map(move |_| RelValue::Projection(row.clone())));
         }
         for (row, n) in delete_counts.into_iter().filter(|(_, n)| *n > 0) {
             duplicate_rows_sent += n as u64 - 1;
-            deletes.extend(std::iter::repeat_n(row, n));
+            let row = row.to_product_value();
+            deletes.extend((0..n).map(move |_| RelValue::Projection(row.clone())));
         }
     }
 

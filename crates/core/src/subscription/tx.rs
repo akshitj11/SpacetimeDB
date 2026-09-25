@@ -3,13 +3,17 @@ use itertools::Either;
 use smallvec::SmallVec;
 use spacetimedb_data_structures::map::{HashCollectionExt as _, HashMap};
 use spacetimedb_datastore::{
-    locking_tx_datastore::{state_view::StateView, TxId},
+    locking_tx_datastore::{
+        state_view::{MapPageErrors, StateView, TableScan},
+        TxId,
+    },
     traits::TxData,
 };
+use spacetimedb_engine::error::DatastoreError;
 use spacetimedb_execution::{Datastore, DeltaStore, Row};
 use spacetimedb_lib::{query::Delta, AlgebraicValue, ProductValue};
 use spacetimedb_primitives::{IndexId, TableId};
-use spacetimedb_table::table::{IndexScanPointIter, IndexScanRangeIter, TableScanIter};
+use spacetimedb_table::table::{IndexScanPointIter, IndexScanRangeIter};
 use std::{
     collections::BTreeMap,
     ops::{Deref, RangeBounds},
@@ -116,18 +120,19 @@ impl<'a> From<&'a TxId> for DeltaTx<'a> {
 }
 
 impl Datastore for DeltaTx<'_> {
+    type Error = DatastoreError;
     type TableIter<'a>
-        = TableScanIter<'a>
+        = TableScan<'a>
     where
         Self: 'a;
 
     type RangeIndexIter<'a>
-        = IndexScanRangeIter<'a>
+        = MapPageErrors<IndexScanRangeIter<'a>>
     where
         Self: 'a;
 
     type PointIndexIter<'a>
-        = IndexScanPointIter<'a>
+        = MapPageErrors<IndexScanPointIter<'a>>
     where
         Self: 'a;
 
@@ -136,7 +141,7 @@ impl Datastore for DeltaTx<'_> {
     }
 
     fn table_scan<'a>(&'a self, table_id: TableId) -> anyhow::Result<Self::TableIter<'a>> {
-        self.tx.table_scan(table_id)
+        self.tx.table_scan(table_id).map(MapPageErrors::new)
     }
 
     fn index_scan_range<'a>(
@@ -145,7 +150,9 @@ impl Datastore for DeltaTx<'_> {
         index_id: IndexId,
         range: &impl RangeBounds<AlgebraicValue>,
     ) -> anyhow::Result<Self::RangeIndexIter<'a>> {
-        self.tx.index_scan_range(table_id, index_id, range)
+        self.tx
+            .index_scan_range(table_id, index_id, range)
+            .map(MapPageErrors::new)
     }
 
     fn index_scan_point<'a>(
@@ -154,7 +161,9 @@ impl Datastore for DeltaTx<'_> {
         index_id: IndexId,
         point: &AlgebraicValue,
     ) -> anyhow::Result<Self::PointIndexIter<'a>> {
-        self.tx.index_scan_point(table_id, index_id, point)
+        self.tx
+            .index_scan_point(table_id, index_id, point)
+            .map(MapPageErrors::new)
     }
 }
 

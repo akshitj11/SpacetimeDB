@@ -1418,6 +1418,7 @@ impl SubscriptionManager {
             .expect("This read should always succeed, and it's a bug if it doesn't")
             .next()
             .map(|row| {
+                let row = row.expect("This read should always succeed, and it is a bug if it does not");
                 row.read_col(edge.rhs_col)
                     .expect("This read should always succeed, and it's a bug if it doesn't")
             })
@@ -1554,6 +1555,7 @@ impl SubscriptionManager {
             .expect("This read should always succeed, and it's a bug if it doesn't")
             .next()
             .map(|row| {
+                let row = row.expect("This read should always succeed, and it is a bug if it does not");
                 row.read_col(edge.rhs_col)
                     .expect("This read should always succeed, and it's a bug if it doesn't")
             })

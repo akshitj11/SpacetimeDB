@@ -1995,7 +1995,7 @@ impl<'page> Iterator for VarLenGranulesIter<'page> {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PageMetadata {
     pub num_rows: u16,
     pub bytes_used_by_rows: u32,

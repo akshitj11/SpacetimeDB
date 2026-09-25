@@ -744,7 +744,12 @@ fn refresh_views(
     hooks: &HookFunctions<'_>,
     module_def: &ModuleDef,
 ) -> SysCallResult<MutTxId> {
-    let views_for_refresh = tx.views_for_refresh().cloned().collect::<Vec<_>>();
+    let views_for_refresh = tx
+        .views_for_refresh()
+        .map_err(crate::error::DBError::from)
+        .map_err(NodesError::from)?
+        .cloned()
+        .collect::<Vec<_>>();
     let stdb = get_env(scope)?.instance_env.relational_db().clone();
     let database_identity = *get_env(scope)?.instance_env.database_identity();
     let mut tx_slot = get_env(scope)?.instance_env.tx.clone();

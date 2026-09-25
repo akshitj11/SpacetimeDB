@@ -134,11 +134,11 @@ pub unsafe trait ReadColumn: Sized {
     ///   plus trailing padding bytes so that the size is a multiple of the alignment.
     ///
     /// - The offset of a sum's tag bit is the maximum size of its variants' payloads.
-    unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self;
+    unsafe fn unchecked_read_column(row_ref: &RowRef<'_>, layout: &ProductTypeElementLayout) -> Self;
 
     /// Check that the `idx`th column of the row type stored by `row_ref` is compatible with `Self`,
     /// and read the value of that column from `row_ref`.
-    fn read_column(row_ref: RowRef<'_>, idx: usize) -> Result<Self, TypeError> {
+    fn read_column(row_ref: &RowRef<'_>, idx: usize) -> Result<Self, TypeError> {
         let layout = row_ref.row_layout().product();
 
         // Look up the `ProductTypeElementLayout` of the requested column,
@@ -173,7 +173,7 @@ unsafe impl ReadColumn for bool {
         matches!(ty, AlgebraicTypeLayout::Primitive(PrimitiveType::Bool))
     }
 
-    unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
+    unsafe fn unchecked_read_column(row_ref: &RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
         debug_assert!(Self::is_compatible_type(&layout.ty));
 
         let (page, offset) = row_ref.page_and_offset();
@@ -198,7 +198,7 @@ macro_rules! impl_read_column_number {
             }
 
             unsafe fn unchecked_read_column(
-                row_ref: RowRef<'_>,
+                row_ref: &RowRef<'_>,
                 layout: &ProductTypeElementLayout,
             ) -> Self {
                 debug_assert!(Self::is_compatible_type(&layout.ty));
@@ -244,7 +244,7 @@ unsafe impl ReadColumn for AlgebraicValue {
     fn is_compatible_type(_ty: &AlgebraicTypeLayout) -> bool {
         true
     }
-    unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
+    unsafe fn unchecked_read_column(row_ref: &RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
         let curr_offset = Cell::new(layout.offset as usize);
         let blob_store = row_ref.blob_store();
         let (page, page_offset) = row_ref.page_and_offset();
@@ -273,7 +273,7 @@ macro_rules! impl_read_column_via_av {
             }
 
             unsafe fn unchecked_read_column(
-                row_ref: RowRef<'_>,
+                row_ref: &RowRef<'_>,
                 layout: &ProductTypeElementLayout,
             ) -> Self {
                 debug_assert!(Self::is_compatible_type(&layout.ty));
@@ -315,7 +315,7 @@ macro_rules! impl_read_column_via_from {
                     <$base>::is_compatible_type(ty)
                 }
 
-                unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
+                unsafe fn unchecked_read_column(row_ref: &RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
                     // SAFETY: We use `$base`'s notion of compatible types, so we can forward promises.
                     <$target>::from(unsafe { <$base>::unchecked_read_column(row_ref, layout) })
                 }
@@ -348,7 +348,7 @@ unsafe impl ReadColumn for SumTag {
         matches!(ty, AlgebraicTypeLayout::Sum(_))
     }
 
-    unsafe fn unchecked_read_column(row_ref: RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
+    unsafe fn unchecked_read_column(row_ref: &RowRef<'_>, layout: &ProductTypeElementLayout) -> Self {
         debug_assert!(Self::is_compatible_type(&layout.ty));
 
         let (page, offset) = row_ref.page_and_offset();
@@ -367,8 +367,8 @@ unsafe impl ReadColumn for SumTag {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::blob_store::HashMapBlobStore;
     use crate::table::test::table;
-    use crate::{blob_store::HashMapBlobStore, page_pool::PagePool};
     use proptest::{prelude::*, prop_assert_eq, proptest, test_runner::TestCaseResult};
     use spacetimedb_sats::{product, proptest::generate_typed_row};
 
@@ -382,11 +382,10 @@ mod test {
         /// inserting the row, then doing `AlgebraicValue::read_column` on each column of the row
         /// returns the expected value.
         fn read_column_same_value((ty, val) in generate_typed_row()) {
-            let pool = PagePool::new_for_test();
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty);
 
-            let (_, row_ref) = table.insert(&pool, &mut blob_store, &val).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
             for (idx, orig_col_value) in val.into_iter().enumerate() {
                 let read_col_value = row_ref.read_col::<AlgebraicValue>(idx).unwrap();
@@ -399,29 +398,28 @@ mod test {
         /// which does not match the actual column type
         /// returns an appropriate error.
         fn read_column_wrong_type((ty, val) in generate_typed_row()) {
-            let pool = PagePool::new_for_test();
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty.clone());
 
-            let (_, row_ref) = table.insert(&pool, &mut blob_store, &val).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
             for (idx, col_ty) in ty.elements.iter().enumerate() {
-                assert_wrong_type_error::<u8>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U8)?;
-                assert_wrong_type_error::<i8>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I8)?;
-                assert_wrong_type_error::<u16>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U16)?;
-                assert_wrong_type_error::<i16>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I16)?;
-                assert_wrong_type_error::<u32>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U32)?;
-                assert_wrong_type_error::<i32>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I32)?;
-                assert_wrong_type_error::<u64>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U64)?;
-                assert_wrong_type_error::<i64>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I64)?;
-                assert_wrong_type_error::<u128>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U128)?;
-                assert_wrong_type_error::<i128>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I128)?;
-                assert_wrong_type_error::<u256>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U256)?;
-                assert_wrong_type_error::<i256>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I256)?;
-                assert_wrong_type_error::<f32>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F32)?;
-                assert_wrong_type_error::<f64>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F64)?;
-                assert_wrong_type_error::<bool>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::Bool)?;
-                assert_wrong_type_error::<Box<str>>(row_ref, idx, &col_ty.algebraic_type, AlgebraicType::String)?;
+                assert_wrong_type_error::<u8>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U8)?;
+                assert_wrong_type_error::<i8>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I8)?;
+                assert_wrong_type_error::<u16>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U16)?;
+                assert_wrong_type_error::<i16>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I16)?;
+                assert_wrong_type_error::<u32>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U32)?;
+                assert_wrong_type_error::<i32>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I32)?;
+                assert_wrong_type_error::<u64>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U64)?;
+                assert_wrong_type_error::<i64>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I64)?;
+                assert_wrong_type_error::<u128>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U128)?;
+                assert_wrong_type_error::<i128>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I128)?;
+                assert_wrong_type_error::<u256>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::U256)?;
+                assert_wrong_type_error::<i256>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::I256)?;
+                assert_wrong_type_error::<f32>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F32)?;
+                assert_wrong_type_error::<f64>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::F64)?;
+                assert_wrong_type_error::<bool>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::Bool)?;
+                assert_wrong_type_error::<Box<str>>(&row_ref, idx, &col_ty.algebraic_type, AlgebraicType::String)?;
             }
         }
 
@@ -430,11 +428,10 @@ mod test {
         /// i.e. with an out-of-bounds index,
         /// returns an appropriate error.
         fn read_column_out_of_bounds((ty, val) in generate_typed_row()) {
-            let pool = PagePool::new_for_test();
             let mut blob_store = HashMapBlobStore::default();
             let mut table = table(ty.clone());
 
-            let (_, row_ref) = table.insert(&pool, &mut blob_store, &val).unwrap();
+            let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
 
             let oob = ty.elements.len();
 
@@ -462,7 +459,7 @@ mod test {
     ///
     /// If `col_ty == correct_col_ty`, do nothing.
     fn assert_wrong_type_error<Col: ReadColumn + PartialEq + std::fmt::Debug>(
-        row_ref: RowRef<'_>,
+        row_ref: &RowRef<'_>,
         col_idx: usize,
         col_ty: &AlgebraicType,
         correct_col_ty: AlgebraicType,
@@ -488,12 +485,11 @@ mod test {
         ($name:ident { $algebraic_type:expr => $rust_type:ty = $val:expr }) => {
             #[test]
             fn $name() {
-                let pool = PagePool::new_for_test();
                 let mut blob_store = HashMapBlobStore::default();
                 let mut table = table(ProductType::from_iter([$algebraic_type]));
 
                 let val: $rust_type = $val;
-                let (_, row_ref) = table.insert(&pool, &mut blob_store, &product![val.clone()]).unwrap();
+                let (_, row_ref) = table.insert(&mut blob_store, &product![val.clone()]).unwrap();
 
                 assert_eq!(val, row_ref.read_col::<$rust_type>(0).unwrap());
             }
@@ -550,12 +546,11 @@ mod test {
     fn read_sum_tag_from_sum_with_payload() {
         let algebraic_type = AlgebraicType::sum([("a", AlgebraicType::U8), ("b", AlgebraicType::U16)]);
 
-        let pool = PagePool::new_for_test();
         let mut blob_store = HashMapBlobStore::default();
         let mut table = table(ProductType::from([algebraic_type]));
 
         let val = SumValue::new(1, 42u16);
-        let (_, row_ref) = table.insert(&pool, &mut blob_store, &product![val.clone()]).unwrap();
+        let (_, row_ref) = table.insert(&mut blob_store, &product![val.clone()]).unwrap();
 
         assert_eq!(val.tag, row_ref.read_col::<SumTag>(0).unwrap().0);
     }

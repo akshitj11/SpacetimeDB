@@ -21,19 +21,20 @@ use spacetimedb_table::table::IndexScanPointIter;
 use spacetimedb_table::{
     blob_store::HashMapBlobStore,
     table::{IndexScanRangeIter, RowRef, Table, TableScanIter},
+    tiered::PageError,
 };
 use std::sync::Arc;
 
 // StateView trait, is designed to define the behavior of viewing internal datastore states.
 // Currently, it applies to: CommittedState, MutTxId, and TxId.
 pub trait StateView {
-    type Iter<'a>: Iterator<Item = RowRef<'a>>
+    type Iter<'a>: Iterator<Item = Result<RowRef<'a>>>
     where
         Self: 'a;
-    type IterByColRange<'a, R: RangeBounds<AlgebraicValue>>: Iterator<Item = RowRef<'a>>
+    type IterByColRange<'a, R: RangeBounds<AlgebraicValue>>: Iterator<Item = Result<RowRef<'a>>>
     where
         Self: 'a;
-    type IterByColEq<'a, 'r>: Iterator<Item = RowRef<'a>>
+    type IterByColEq<'a, 'r>: Iterator<Item = Result<RowRef<'a>>>
     where
         Self: 'a;
 
@@ -41,8 +42,14 @@ pub trait StateView {
 
     fn table_id_from_name(&self, table_name: &str) -> Result<Option<TableId>> {
         let name = &<Box<str>>::from(table_name).into();
-        let row = self.iter_by_col_eq(ST_TABLE_ID, StTableFields::TableName, name)?.next();
-        Ok(row.map(|row| row.read_col(StTableFields::TableId).unwrap()))
+        match self.iter_by_col_eq(ST_TABLE_ID, StTableFields::TableName, name)?.next() {
+            Some(row) => {
+                let row = row?;
+                let table_id = row.read_col(StTableFields::TableId).unwrap();
+                Ok(Some(table_id))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Looks up a table id by the table's canonical name or its accessor/alias name.
@@ -93,7 +100,7 @@ pub trait StateView {
             .iter_by_col_eq(ST_TABLE_ID, StTableFields::TableId, &table_id.into())?
             .next()
             .ok_or_else(|| TableError::IdNotFound(SystemTable::st_table, table_id.into()))?;
-        StTableRow::try_from(row_ref)
+        StTableRow::try_from(row_ref?)
     }
 
     fn find_st_event_table_row(&self, table_id: TableId) -> Result<StEventTableRow> {
@@ -101,7 +108,7 @@ pub trait StateView {
             .iter_by_col_eq(ST_EVENT_TABLE_ID, StEventTableFields::TableId, &table_id.into())?
             .next()
             .ok_or_else(|| TableError::IdNotFound(SystemTable::st_event_table, table_id.into()))?;
-        StEventTableRow::try_from(row_ref)
+        StEventTableRow::try_from(row_ref?)
     }
 
     /// Look up an `st_table_accessor` row by its accessor name
@@ -112,7 +119,7 @@ pub trait StateView {
             &accessor_name.into(),
         )?
         .next()
-        .map(StTableAccessorRow::try_from)
+        .map(|row| row.and_then(StTableAccessorRow::try_from))
         .transpose()
     }
 
@@ -124,7 +131,7 @@ pub trait StateView {
             &accessor_name.into(),
         )?
         .next()
-        .map(StIndexAccessorRow::try_from)
+        .map(|row| row.and_then(StIndexAccessorRow::try_from))
         .transpose()
     }
 
@@ -135,7 +142,10 @@ pub trait StateView {
             StIndexAccessorFields::IndexName,
             &index_name.into(),
         ) {
-            Ok(mut iter) => iter.next().map(StIndexAccessorRow::try_from).transpose(),
+            Ok(mut iter) => iter
+                .next()
+                .map(|row| row.and_then(StIndexAccessorRow::try_from))
+                .transpose(),
             // `schema_for_table_raw` is called while restoring snapshots,
             // before `migrate_system_tables` creates newer system tables.
             // Treat a missing `st_index_accessor` as "no aliases yet" here.
@@ -151,7 +161,10 @@ pub trait StateView {
             [StColumnAccessorFields::TableName, StColumnAccessorFields::ColName],
             &AlgebraicValue::product([table_name.into(), col_name.into()]),
         ) {
-            Ok(mut iter) => iter.next().map(StColumnAccessorRow::try_from).transpose(),
+            Ok(mut iter) => iter
+                .next()
+                .map(|row| row.and_then(StColumnAccessorRow::try_from))
+                .transpose(),
             // `schema_for_table_raw` is called while restoring snapshots,
             // before `migrate_system_tables` creates newer system tables.
             // We therefore treat a missing `st_column_accessor` as "no aliases yet".
@@ -177,7 +190,7 @@ pub trait StateView {
         // Look up the columns for the table in question.
         let mut columns: Vec<ColumnSchema> = iter_st_column_for_table(self, &table_id.into())?
             .map(|row_ref| {
-                let row = StColumnRow::try_from(row_ref)?;
+                let row = StColumnRow::try_from(row_ref?)?;
                 let mut column_schema = ColumnSchema::from(row);
                 let alias = self
                     .find_st_column_accessor_row(table_name.as_ref(), &column_schema.col_name)?
@@ -194,7 +207,7 @@ pub trait StateView {
         let constraints = self
             .iter_by_col_eq(ST_CONSTRAINT_ID, StConstraintFields::TableId, value_eq)?
             .map(|row| {
-                let row = StConstraintRow::try_from(row)?;
+                let row = StConstraintRow::try_from(row?)?;
                 Ok(row.into())
             })
             .collect::<Result<Vec<_>>>()?;
@@ -203,7 +216,7 @@ pub trait StateView {
         let sequences = self
             .iter_by_col_eq(ST_SEQUENCE_ID, StSequenceFields::TableId, value_eq)?
             .map(|row| {
-                let row = StSequenceRow::try_from(row)?;
+                let row = StSequenceRow::try_from(row?)?;
                 Ok(row.into())
             })
             .collect::<Result<Vec<_>>>()?;
@@ -212,7 +225,7 @@ pub trait StateView {
         let indexes = self
             .iter_by_col_eq(ST_INDEX_ID, StIndexFields::TableId, value_eq)?
             .map(|row| {
-                let row = StIndexRow::try_from(row)?;
+                let row = StIndexRow::try_from(row?)?;
                 let mut index_schema = IndexSchema::from(row);
                 index_schema.alias = self
                     .find_st_index_accessor_row_by_index_name(index_schema.index_name.as_ref())?
@@ -225,7 +238,7 @@ pub trait StateView {
             .iter_by_col_eq(ST_SCHEDULED_ID, StScheduledFields::TableId, value_eq)?
             .next()
             .map(|row| -> Result<_> {
-                let row = StScheduledRow::try_from(row)?;
+                let row = StScheduledRow::try_from(row?)?;
                 Ok(row.into())
             })
             .transpose()?;
@@ -239,7 +252,7 @@ pub trait StateView {
             )
             .map(|mut iter| {
                 iter.next().map(|row| -> Result<_> {
-                    let row = StViewRow::try_from(row)?;
+                    let row = StViewRow::try_from(row?)?;
 
                     Ok(ViewDefInfo {
                         view_id: row.view_id,
@@ -274,7 +287,7 @@ pub trait StateView {
         ) {
             Ok(mut iter) => iter
                 .next()
-                .map(StTableAccessorRow::try_from)
+                .map(|row| row.and_then(StTableAccessorRow::try_from))
                 .transpose()?
                 .map(|row| row.accessor_name),
             Err(DatastoreError::Table(TableError::IdNotFound(..))) => None,
@@ -319,7 +332,10 @@ pub trait StateView {
             &ConnectionIdViaU128::from(connection_id).into(),
         )?
             .next()
-            .map(|row| row.read_via_bsatn::<StConnectionCredentialsRow>(&mut buf).map(|r| r.jwt_payload))
+            .transpose()?
+            .map(|row| {
+                row.read_via_bsatn::<StConnectionCredentialsRow>(&mut buf).map(|r| r.jwt_payload)
+            })
             .transpose()
             .map_err(|e| {
                 log::error!(
@@ -338,7 +354,7 @@ pub trait StateView {
 pub(crate) fn iter_st_column_for_table<'a>(
     this: &'a (impl StateView + ?Sized),
     table_id: &'a AlgebraicValue,
-) -> Result<impl 'a + Iterator<Item = RowRef<'a>>> {
+) -> Result<impl 'a + Iterator<Item = Result<RowRef<'a>>>> {
     this.iter_by_col_eq(ST_COLUMN_ID, StColumnFields::TableId, table_id)
 }
 
@@ -360,7 +376,7 @@ impl<'a> IterMutTx<'a> {
             .get(&table_id)
             .map(|table| (table, &tx_state.blob_store));
 
-        let iter = commit_table.scan_rows(&committed_state.blob_store);
+        let iter = MapPageErrors::new(commit_table.scan_rows(&committed_state.blob_store));
         let stage = if let Some(deletes) = tx_state.get_delete_table(table_id) {
             // There are deletes in the tx state
             // so we must exclude those (1b).
@@ -378,18 +394,18 @@ impl<'a> IterMutTx<'a> {
 
 enum ScanStage<'a> {
     /// Yielding rows from the current tx.
-    CurrentTx { iter: TableScanIter<'a> },
+    CurrentTx { iter: TableScan<'a> },
     /// Yielding rows from the committed state
     /// without considering tx state deletes as there are none.
-    CommittedNoTxDeletes { iter: TableScanIter<'a> },
+    CommittedNoTxDeletes { iter: TableScan<'a> },
     /// Yielding rows from the committed state
     /// but there are deleted rows in the tx state,
     /// so we must check against those.
-    CommittedWithTxDeletes { iter: FilterDeleted<'a, TableScanIter<'a>> },
+    CommittedWithTxDeletes { iter: FilterDeleted<'a, TableScan<'a>> },
 }
 
 impl<'a> Iterator for IterMutTx<'a> {
-    type Item = RowRef<'a>;
+    type Item = Result<RowRef<'a>>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -403,8 +419,8 @@ impl<'a> Iterator for IterMutTx<'a> {
                 ScanStage::CommittedNoTxDeletes { iter } => {
                     // (1a) Go through the committed state for this table
                     // but do not consider deleted rows.
-                    if let next @ Some(_) = iter.next() {
-                        return next;
+                    if let Some(next) = iter.next() {
+                        return Some(next);
                     }
                 }
                 ScanStage::CommittedWithTxDeletes { iter } => {
@@ -434,8 +450,8 @@ impl<'a> Iterator for IterMutTx<'a> {
                     //
                     // As a result, in MVCC, this branch will need to check if the `row_ref`
                     // also exists in the `tx_state.insert_tables` and ensure it is yielded only once.
-                    if let next @ Some(_) = iter.next() {
-                        return next;
+                    if let Some(next) = iter.next() {
+                        return Some(next);
                     }
                 }
                 ScanStage::CurrentTx { iter } => {
@@ -447,16 +463,35 @@ impl<'a> Iterator for IterMutTx<'a> {
             // (2) We got here, so we must've exhausted the committed changes.
             // Start looking in the current tx for inserts, if any, in (3).
             let (insert_table, blob_store) = self.tx_state_ins?;
-            let iter = insert_table.scan_rows(blob_store);
+            let iter = MapPageErrors::new(insert_table.scan_rows(blob_store));
             self.stage = ScanStage::CurrentTx { iter };
         }
+    }
+}
+
+pub struct MapPageErrors<I>(I);
+
+impl<I> MapPageErrors<I> {
+    pub fn new(iter: I) -> Self {
+        Self(iter)
+    }
+}
+
+impl<'a, I> Iterator for MapPageErrors<I>
+where
+    I: Iterator<Item = std::result::Result<RowRef<'a>, PageError>>,
+{
+    type Item = Result<RowRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|row| row.map_err(Into::into))
     }
 }
 
 /// A filter on a row.
 pub trait RowFilter {
     /// Does this filter include `row`?
-    fn filter<'a>(&self, row: RowRef<'a>) -> bool;
+    fn filter(&self, row: &RowRef<'_>) -> bool;
 }
 
 /// A row filter that matches `range` for the given `cols` of rows.
@@ -466,7 +501,7 @@ pub struct RangeOnColumn<R> {
 }
 
 impl<R: RangeBounds<AlgebraicValue>> RowFilter for RangeOnColumn<R> {
-    fn filter<'a>(&self, row: RowRef<'a>) -> bool {
+    fn filter(&self, row: &RowRef<'_>) -> bool {
         self.range.contains(&row.project(&self.cols).unwrap())
     }
 }
@@ -478,7 +513,7 @@ pub struct EqOnColumn<'r> {
 }
 
 impl RowFilter for EqOnColumn<'_> {
-    fn filter<'a>(&self, row: RowRef<'a>) -> bool {
+    fn filter(&self, row: &RowRef<'_>) -> bool {
         self.val == &row.project(&self.cols).unwrap()
     }
 }
@@ -496,17 +531,26 @@ impl<F, I> ApplyFilter<F, I> {
     }
 }
 
-impl<'a, F: RowFilter, I: Iterator<Item = RowRef<'a>>> Iterator for ApplyFilter<F, I> {
-    type Item = RowRef<'a>;
+impl<'a, F: RowFilter, I: Iterator<Item = Result<RowRef<'a>>>> Iterator for ApplyFilter<F, I> {
+    type Item = Result<RowRef<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.find(|row| self.filter.filter(*row))
+        for row in &mut self.iter {
+            match row {
+                Err(err) => return Some(Err(err)),
+                Ok(row) if self.filter.filter(&row) => return Some(Ok(row)),
+                Ok(_) => {}
+            }
+        }
+        None
     }
 }
 
-type ScanFilterTx<'a, F> = ApplyFilter<F, TableScanIter<'a>>;
-pub type IterByColRangeTx<'a, R> = ScanOrIndex<ScanFilterTx<'a, RangeOnColumn<R>>, IndexScanRangeIter<'a>>;
-pub type IterByColEqTx<'a, 'r> = ScanOrIndex<ScanFilterTx<'a, EqOnColumn<'r>>, IndexScanPointIter<'a>>;
+pub type TableScan<'a> = MapPageErrors<TableScanIter<'a>>;
+type ScanFilterTx<'a, F> = ApplyFilter<F, TableScan<'a>>;
+pub type IterByColRangeTx<'a, R> =
+    ScanOrIndex<ScanFilterTx<'a, RangeOnColumn<R>>, MapPageErrors<IndexScanRangeIter<'a>>>;
+pub type IterByColEqTx<'a, 'r> = ScanOrIndex<ScanFilterTx<'a, EqOnColumn<'r>>, MapPageErrors<IndexScanPointIter<'a>>>;
 
 type ScanFilterMutTx<'a, F> = ApplyFilter<F, IterMutTx<'a>>;
 pub type IterByColRangeMutTx<'a, R> = ScanOrIndex<ScanFilterMutTx<'a, RangeOnColumn<R>>, IndexScanRanged<'a>>;
@@ -537,10 +581,10 @@ impl<'r, I, Idx> ScanOrIndex<ApplyFilter<EqOnColumn<'r>, I>, Idx> {
 
 impl<'a, S, I> Iterator for ScanOrIndex<S, I>
 where
-    S: Iterator<Item = RowRef<'a>>,
-    I: Iterator<Item = RowRef<'a>>,
+    S: Iterator<Item = Result<RowRef<'a>>>,
+    I: Iterator<Item = Result<RowRef<'a>>>,
 {
-    type Item = RowRef<'a>;
+    type Item = Result<RowRef<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {

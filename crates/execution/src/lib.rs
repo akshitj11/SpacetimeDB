@@ -59,18 +59,20 @@ impl ParamResolver for ExecutionParams {
 }
 
 pub trait Datastore {
+    type Error: Into<anyhow::Error>;
+
     /// Iterator type for table scans
-    type TableIter<'a>: Iterator<Item = RowRef<'a>> + 'a
+    type TableIter<'a>: Iterator<Item = std::result::Result<RowRef<'a>, Self::Error>> + 'a
     where
         Self: 'a;
 
     /// Iterator type for ranged index scans.
-    type RangeIndexIter<'a>: Iterator<Item = RowRef<'a>> + 'a
+    type RangeIndexIter<'a>: Iterator<Item = std::result::Result<RowRef<'a>, Self::Error>> + 'a
     where
         Self: 'a;
 
     /// Iterator type for point index scans.
-    type PointIndexIter<'a>: Iterator<Item = RowRef<'a>> + 'a
+    type PointIndexIter<'a>: Iterator<Item = std::result::Result<RowRef<'a>, Self::Error>> + 'a
     where
         Self: 'a;
 
@@ -212,7 +214,7 @@ impl ToBsatn for Row<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum RelValue<'a> {
     Row(Row<'a>),
     Projection(ProductValue),
@@ -241,6 +243,15 @@ impl PartialEq for RelValue<'_> {
 }
 
 impl Eq for RelValue<'_> {}
+
+impl RelValue<'_> {
+    pub fn to_product_value(&self) -> ProductValue {
+        match self {
+            Self::Row(row) => row.to_product_value(),
+            Self::Projection(value) => value.clone(),
+        }
+    }
+}
 
 impl Hash for RelValue<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -282,7 +293,7 @@ impl ToBsatn for RelValue<'_> {
 impl ProjectField for Row<'_> {
     fn project(&self, field: &TupleField) -> AlgebraicValue {
         match self {
-            Self::Ptr(ptr) => ptr.project(field),
+            Self::Ptr(ptr) => ProjectField::project(ptr, field),
             Self::Ref(val) => val.project(field),
         }
     }
@@ -297,7 +308,7 @@ pub enum Tuple<'a> {
     Join(Vec<Row<'a>>),
 }
 
-static_assert_size!(Tuple, 40);
+static_assert_size!(Tuple, 48);
 
 impl ProjectField for Tuple<'_> {
     fn project(&self, field: &TupleField) -> AlgebraicValue {

@@ -1803,7 +1803,11 @@ impl WasmInstanceEnv {
             )));
         };
 
-        let views_for_refresh = tx.views_for_refresh().cloned().collect::<Vec<_>>();
+        let views_for_refresh = tx
+            .views_for_refresh()
+            .map_err(|error| WasmError::Wasm(error.into()))?
+            .cloned()
+            .collect::<Vec<_>>();
         let mut tx = Some(tx);
         let mut tx_slot = caller.data().instance_env.tx.clone();
 

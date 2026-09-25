@@ -1,7 +1,7 @@
 use super::{
     committed_state::CommittedState,
     datastore::{Result, TxMetrics},
-    state_view::{IterByColRangeTx, StateView},
+    state_view::{IterByColRangeTx, StateView, TableScan},
     IterByColEqTx, SharedReadGuard,
 };
 use crate::{error::IndexError, execution_context::ExecutionContext};
@@ -14,6 +14,7 @@ use spacetimedb_schema::{reducer_name::ReducerName, schema::TableSchema};
 use spacetimedb_table::{
     table::{IndexScanPointIter, IndexScanRangeIter, TableAndIndex, TableScanIter},
     table_index::IndexCannotSeekRange,
+    tiered::PageError,
 };
 use std::sync::Arc;
 use std::{future, num::NonZeroU64};
@@ -34,6 +35,7 @@ pub struct TxId {
 }
 
 impl Datastore for TxId {
+    type Error = PageError;
     type TableIter<'a>
         = TableScanIter<'a>
     where
@@ -82,7 +84,7 @@ impl Datastore for TxId {
 }
 
 impl StateView for TxId {
-    type Iter<'a> = TableScanIter<'a>;
+    type Iter<'a> = TableScan<'a>;
     type IterByColRange<'a, R: RangeBounds<AlgebraicValue>> = IterByColRangeTx<'a, R>;
     type IterByColEq<'a, 'r>
         = IterByColEqTx<'a, 'r>

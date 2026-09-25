@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use spacetimedb_memory_usage::MemoryUsage;
 use spacetimedb_sats::layout::Size;
 
 use crate::{
@@ -17,12 +18,13 @@ use crate::{
 
 pub use crate::tiered::page_manager::PageError;
 
+#[derive(Debug)]
 pub struct PageSet {
-    eviction_policy: PageEvictionPolicy,
+    pub eviction_policy: PageEvictionPolicy,
     slots: Vec<PageSlotHandle>,
     free_page_slots: BTreeSet<PageIndex>,
     non_full_pages: BTreeSet<(usize, PageIndex)>,
-    manager: Arc<PageManager>,
+    pub(crate) manager: Arc<PageManager>,
 }
 
 impl PageSet {
@@ -71,6 +73,23 @@ impl PageSet {
             return Ok(None);
         };
         self.manager.get(slot, self.eviction_policy)
+    }
+
+    pub fn iter_pages_with_hashes(
+        &self,
+    ) -> impl Iterator<Item = Result<Option<(blake3::Hash, PageHandle)>, PageError>> {
+        self.slots.iter().map(|slot| {
+            if slot.is_absent() {
+                Ok(None)
+            } else {
+                let hash = self
+                    .manager
+                    .with_page_mut(slot, self.eviction_policy, |page| page.save_or_get_content_hash())?;
+                let page = self.manager.get(slot, self.eviction_policy)?.unwrap();
+
+                Ok(Some((hash, page)))
+            }
+        })
     }
 
     pub fn with_page_mut<T>(
@@ -228,5 +247,417 @@ impl PageSet {
             .iter()
             .enumerate()
             .filter_map(|(idx, slot)| (!slot.is_absent()).then_some((PageIndex(idx as _), slot)))
+    }
+
+    /// The number of present pages in `self`.
+    ///
+    /// Includes resident as well as non-resident pages, but not freed ones.
+    pub fn num_present_pages(&self) -> usize {
+        self.slots
+            .len()
+            .checked_sub(self.free_page_slots.len())
+            .expect("pages len to be greater than number of free slots")
+    }
+
+    /// The total number of pages in `self`.
+    ///
+    /// Includes resident, non-resident and absent (i.e. freed) pages.
+    pub fn num_pages(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn prepare_commit(
+        &self,
+        fixed_row_size: Size,
+        visitor: &impl VarLenMembers,
+        deletes: impl IntoIterator<Item = RowPointer>,
+        inserts: impl IntoIterator<Item = (ProductValue, usize)>,
+    ) -> Result<PreparedCommit, PageError> {
+        let mut allocator = PageAllocator::new(fixed_row_size, &self.slots);
+        let mut pinned = BTreeMap::new();
+
+        let deletes = deletes
+            .into_iter()
+            .map(|row_ptr| {
+                let page_index = row_ptr.page_index();
+                if let btree_map::Entry::Vacant(entry) = pinned.entry(page_index) {
+                    let page = self.get_page(page_index)?.expect("delete from absent page");
+                    entry.insert(page);
+                }
+                let granules = unsafe {
+                    pinned[&page_index]
+                        .read()
+                        .row_total_granules(row_ptr.page_offset(), fixed_row_size, visitor)
+                };
+                allocator.prepare_delete::<Infallible>(page_index, granules, |page_index| {
+                    Ok(pinned[&page_index].read().capacity(fixed_row_size))
+                });
+
+                Ok(row_ptr)
+            })
+            .collect::<Result<_, PageError>>()?;
+
+        let inserts = inserts
+            .into_iter()
+            .map(|(row, num_granules)| {
+                let page_index = allocator.prepare_insert::<PageError>(num_granules, |page_index| {
+                    match pinned.entry(page_index) {
+                        btree_map::Entry::Vacant(entry) => {
+                            let page = self.get_page(page_index)?.expect("delete from absent page");
+                            let page = entry.insert(page);
+                            Ok(page.read().capacity(fixed_row_size))
+                        }
+                        btree_map::Entry::Occupied(entry) => Ok(entry.get().read().capacity(fixed_row_size)),
+                    }
+                })?;
+                Ok(PlannedInsert { page_index, row })
+            })
+            .collect::<Result<_, PageError>>()?;
+
+        let reserved = allocator
+            .pages_to_allocate()
+            .map(|page_index| {
+                self.manager
+                    .reserve(fixed_row_size)
+                    .map(|reservation| (page_index, reservation))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        Ok(PreparedCommit {
+            pinned,
+            reserved,
+            deletes,
+            inserts,
+        })
+    }
+}
+
+#[cfg(test)]
+impl PageSet {
+    pub(crate) fn assert_non_full_pages_consistent(&self, fixed_row_size: Size) {
+        let mut seen_page_indexes = BTreeSet::new();
+        for &(_, page_index) in &self.non_full_pages {
+            assert!(
+                seen_page_indexes.insert(page_index),
+                "page {:?} appears multiple times in non_full_pages",
+                page_index
+            );
+        }
+
+        for (idx, slot) in self.slots.iter().enumerate() {
+            let page_index = PageIndex(idx as u64);
+            if !slot.is_absent() {
+                let is_full = slot.is_full(fixed_row_size).unwrap();
+                let available_granules = slot.available_var_len_granules().unwrap();
+                let entries_for_page: Vec<_> = self
+                    .non_full_pages
+                    .iter()
+                    .copied()
+                    .filter(|&(_, idx)| idx == page_index)
+                    .collect();
+
+                if is_full {
+                    assert!(
+                        entries_for_page.is_empty(),
+                        "page {:?} has 0 available var-len granules but appears in non_full_pages as {:?}",
+                        page_index,
+                        entries_for_page
+                    );
+                } else {
+                    assert_eq!(
+                        entries_for_page,
+                        vec![(available_granules, page_index)],
+                        "page {:?} has {} available var-len granules but non_full_pages has {:?}",
+                        page_index,
+                        available_granules,
+                        entries_for_page
+                    );
+                }
+            } else {
+                let entries_for_page: Vec<_> = self
+                    .non_full_pages
+                    .iter()
+                    .copied()
+                    .filter(|&(_free_granules, idx)| idx == page_index)
+                    .collect();
+                assert!(
+                    entries_for_page.is_empty(),
+                    "page slot {:?} is is absent, but appears in non_full_pages as {:?}",
+                    page_index,
+                    entries_for_page,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn iter_present_page_indexes(&self) -> impl Iterator<Item = PageIndex> {
+        self.iter_present_pages_with_page_index().map(|(idx, _)| idx)
+    }
+}
+
+// TODO
+impl MemoryUsage for PageSet {}
+
+pub struct PreparedCommit {
+    /// The pinned or reserved pages to operate on.
+    pinned: BTreeMap<PageIndex, PageHandle>,
+    /// Reserved page allocations.
+    reserved: BTreeMap<PageIndex, ReservedPage>,
+    /// The rows to be deleted in this transaction.
+    deletes: Vec<RowPointer>,
+    /// The rows to be inserted in this transaction, including placement.
+    inserts: Vec<PlannedInsert>,
+}
+
+impl PreparedCommit {
+    pub fn apply(mut self, table: &mut Table, blob_store: &mut dyn BlobStore) -> AppliedCommit {
+        let mut pinned = self.pinned;
+
+        fn collect_arc_slice<T, U>(iter: impl ExactSizeIterator<Item = T>, mut f: impl FnMut(T) -> U) -> Arc<[U]> {
+            let mut arc_slice = Arc::new_uninit_slice(iter.len());
+            let arc_slice_mut = Arc::get_mut(&mut arc_slice).expect("`Arc` must be unique as it was just created");
+
+            for (x, slot) in iter.into_iter().zip(arc_slice_mut) {
+                let y = f(x);
+                slot.write(y);
+            }
+
+            // SAFETY: We wrote to every slot in `arc_slice`, so it is now fully
+            // initialized.
+            unsafe { arc_slice.assume_init() }
+        }
+
+        let deletes = collect_arc_slice(self.deletes.into_iter(), |row_ptr| {
+            table
+                .delete(blob_store, row_ptr, |row| row.to_product_value())
+                .expect("no page faults")
+                .expect("`Table::delete` never returns `None`")
+        });
+        let inserts = collect_arc_slice(self.inserts.into_iter(), |PlannedInsert { page_index, row }| {
+            let schema = table.get_schema();
+            // For event tables, we don't insert into the committed state. The
+            // row is collected regardless, as we include it in subscriptions
+            // and the commitlog.
+            if !schema.is_event {
+                if let Some(reserved) = self.reserved.remove(&page_index) {
+                    let page = table.register(reserved);
+                    let _prev = pinned.insert(page_index, page);
+                    debug_assert!(_prev.is_none());
+                }
+
+                table
+                    .insert(blob_store, &row)
+                    .expect("failed to insert during transaction commit");
+            }
+
+            row
+        });
+
+        drop(pinned);
+
+        AppliedCommit { deletes, inserts }
+    }
+}
+
+pub struct AppliedCommit {
+    deletes: Arc<[ProductValue]>,
+    inserts: Arc<[ProductValue]>,
+}
+
+impl AppliedCommit {
+    pub fn into_parts(self) -> (Arc<[ProductValue]>, Arc<[ProductValue]>) {
+        (self.deletes, self.inserts)
+    }
+}
+
+pub struct PlannedInsert {
+    page_index: PageIndex,
+    row: ProductValue,
+}
+
+enum PlannedPage {
+    /// An existing page affected by a transaction.
+    Existing(PageCapacity),
+    /// A page that needs to be allocated.
+    Allocate(PageCapacity),
+}
+
+impl PlannedPage {
+    fn capacity(&self) -> &PageCapacity {
+        match self {
+            Self::Existing(capacity) | Self::Allocate(capacity) => capacity,
+        }
+    }
+
+    fn capacity_mut(&mut self) -> &mut PageCapacity {
+        match self {
+            Self::Existing(capacity) | Self::Allocate(capacity) => capacity,
+        }
+    }
+}
+
+enum Slot {
+    /// A page slot that has been allocated and then freed.
+    Absent,
+    /// A page slot that is present but not affected by the transaction.
+    Present(PageMetadata),
+    /// A page slot that is affected by the transaction.
+    Planned(PlannedPage),
+}
+
+impl Slot {
+    fn has_space_for_row(&self, fixed_row_size: Size, num_granules: usize) -> bool {
+        match self {
+            Slot::Absent => false,
+            Slot::Present(metadata) => metadata.has_space_for_row(fixed_row_size, num_granules),
+            Slot::Planned(planned) => planned.capacity().has_space_for_row(fixed_row_size, num_granules),
+        }
+    }
+
+    fn available_var_len_granules(&self) -> Option<usize> {
+        match self {
+            Slot::Absent => None,
+            Slot::Present(metadata) => Some(metadata.available_var_len_granules()),
+            Slot::Planned(planned) => Some(planned.capacity().available_var_len_granules()),
+        }
+    }
+}
+
+struct PageAllocator {
+    fixed_row_size: Size,
+    slots: Vec<Slot>,
+    non_full_pages: BTreeSet<(usize, PageIndex)>,
+    free_page_slots: BTreeSet<PageIndex>,
+}
+
+impl PageAllocator {
+    pub fn new(fixed_row_size: Size, pages: &[PageSlotHandle]) -> Self {
+        let mut slots = Vec::with_capacity(pages.len());
+        let mut non_full_pages = BTreeSet::new();
+        let mut free_page_slots = BTreeSet::new();
+
+        for (page_index, handle) in pages.iter().enumerate() {
+            let page_index = PageIndex(page_index as _);
+            match handle.metadata(fixed_row_size) {
+                None => {
+                    slots.push(Slot::Absent);
+                    free_page_slots.insert(page_index);
+                }
+                Some(metadata) => {
+                    slots.push(Slot::Present(metadata));
+                    non_full_pages.insert((metadata.available_var_len_granules(), page_index));
+                }
+            }
+        }
+
+        Self {
+            fixed_row_size,
+            slots,
+            non_full_pages,
+            free_page_slots,
+        }
+    }
+
+    pub fn prepare_delete<E>(
+        &mut self,
+        page_index: PageIndex,
+        row_granules: usize,
+        fault: impl FnMut(PageIndex) -> Result<PageCapacity, E>,
+    ) -> Result<(), E> {
+        self.remove_from_non_full(page_index);
+        let capacity = self.ensure_planned(page_index, fault)?;
+        capacity.release_row(row_granules);
+
+        if capacity.num_rows == 0 {
+            self.slots[page_index.idx()] = Slot::Absent;
+            self.free_page_slots.insert(page_index);
+        } else {
+            self.add_to_non_full(page_index);
+        }
+
+        Ok(())
+    }
+
+    pub fn prepare_insert<E>(
+        &mut self,
+        row_granules: usize,
+        fault: impl FnMut(PageIndex) -> Result<PageCapacity, E>,
+    ) -> Result<PageIndex, E> {
+        let existing = self
+            .non_full_pages
+            .range((row_granules, PageIndex(0))..)
+            .copied()
+            .find(|&(_, index)| self.slots[index.idx()].has_space_for_row(self.fixed_row_size, row_granules));
+
+        match existing {
+            Some((available_granules, page_index)) => {
+                assert!(self.non_full_pages.remove(&(available_granules, page_index)));
+                let fixed_row_size = self.fixed_row_size;
+                let capacity = self.ensure_planned(page_index, fault)?;
+                capacity.reserve_row(fixed_row_size, row_granules);
+                self.add_to_non_full(page_index);
+
+                Ok(page_index)
+            }
+            None => {
+                // No existing page fits. Allocate at a free slot or a new slot.
+                let page_index = if let Some(page_index) = self.free_page_slots.pop_first() {
+                    page_index
+                } else {
+                    let page_index = PageIndex(self.slots.len() as _);
+                    self.slots.push(Slot::Absent);
+                    page_index
+                };
+                assert!(matches!(self.slots[page_index.idx()], Slot::Absent));
+
+                let mut capacity = PageCapacity::empty();
+                capacity.reserve_row(self.fixed_row_size, row_granules);
+
+                self.slots[page_index.idx()] = Slot::Planned(PlannedPage::Allocate(capacity));
+                self.add_to_non_full(page_index);
+
+                Ok(page_index)
+            }
+        }
+    }
+
+    pub fn pages_to_allocate(&self) -> impl Iterator<Item = PageIndex> {
+        self.slots.iter().enumerate().filter_map(|(idx, slot)| match slot {
+            Slot::Absent | Slot::Present(_) | Slot::Planned(PlannedPage::Existing(_)) => None,
+            Slot::Planned(PlannedPage::Allocate(_)) => Some(PageIndex(idx as _)),
+        })
+    }
+
+    fn ensure_planned<E>(
+        &mut self,
+        page_index: PageIndex,
+        mut fault: impl FnMut(PageIndex) -> Result<PageCapacity, E>,
+    ) -> Result<&mut PageCapacity, E> {
+        let slot = &mut self.slots[page_index.idx()];
+        match slot {
+            Slot::Absent => unreachable!("attempt to fault an absent page"),
+            Slot::Present(_metadata) => {
+                let page = fault(page_index).map(PlannedPage::Existing)?;
+                *slot = Slot::Planned(page);
+
+                let Slot::Planned(planned) = slot else { unreachable!() };
+                Ok(planned.capacity_mut())
+            }
+            Slot::Planned(planned) => Ok(planned.capacity_mut()),
+        }
+    }
+
+    fn remove_from_non_full(&mut self, page_index: PageIndex) {
+        if let Some(available_granules) = self.slots[page_index.idx()].available_var_len_granules() {
+            self.non_full_pages.remove(&(available_granules, page_index));
+        }
+    }
+
+    fn add_to_non_full(&mut self, page_index: PageIndex) {
+        if let Some(available_granules) = self.slots[page_index.idx()].available_var_len_granules()
+            && available_granules > 0
+        {
+            self.non_full_pages.insert((available_granules, page_index));
+        }
     }
 }
