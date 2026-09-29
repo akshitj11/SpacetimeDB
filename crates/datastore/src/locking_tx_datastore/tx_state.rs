@@ -16,6 +16,7 @@ use spacetimedb_table::{
     table_index::TableIndex,
 };
 use std::collections::{btree_map, BTreeMap};
+use std::iter::Peekable;
 use thin_vec::ThinVec;
 
 /// A mapping to find the actual index given an `IndexId`.
@@ -307,6 +308,53 @@ impl TxState {
         // SAFETY: we successfully got a `delete_table` before and haven't removed it since.
         let delete_table = unsafe { delete_table.unwrap_unchecked() };
         (tx_table, tx_blob_store, delete_table)
+    }
+
+    pub(super) fn tx_tables(&self) -> impl Iterator<Item = (TableId, Option<&DeleteTable>, Option<&Table>)> {
+        struct Tables<'a> {
+            deletes: Peekable<btree_map::Iter<'a, TableId, DeleteTable>>,
+            inserts: Peekable<btree_map::Iter<'a, TableId, Table>>,
+        }
+
+        impl<'a> Iterator for Tables<'a> {
+            type Item = (TableId, Option<&'a DeleteTable>, Option<&'a Table>);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                use std::cmp::Ordering::*;
+
+                match (self.deletes.peek(), self.inserts.peek()) {
+                    (None, None) => None,
+                    (None, Some(_insert)) => {
+                        let (&table_id, table) = self.inserts.next().unwrap();
+                        Some((table_id, None, Some(table)))
+                    }
+                    (Some(_delete), None) => {
+                        let (&table_id, table) = self.deletes.next().unwrap();
+                        Some((table_id, Some(table), None))
+                    }
+                    (Some(&(&delete_table, _)), Some(&(insert_table, _))) => match delete_table.cmp(insert_table) {
+                        Less => {
+                            let (_, table) = self.deletes.next().unwrap();
+                            Some((delete_table, Some(table), None))
+                        }
+                        Greater => {
+                            let (_, table) = self.inserts.next().unwrap();
+                            Some((*insert_table, None, Some(table)))
+                        }
+                        Equal => {
+                            let (_, delete) = self.deletes.next().unwrap();
+                            let (_, insert) = self.inserts.next().unwrap();
+                            Some((delete_table, Some(delete), Some(insert)))
+                        }
+                    },
+                }
+            }
+        }
+
+        Tables {
+            deletes: self.delete_tables.iter().peekable(),
+            inserts: self.insert_tables.iter().peekable(),
+        }
     }
 }
 

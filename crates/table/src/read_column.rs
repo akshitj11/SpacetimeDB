@@ -179,6 +179,7 @@ unsafe impl ReadColumn for bool {
         let (page, offset) = row_ref.page_and_offset();
         let col_offset = offset + PageOffset(layout.offset);
 
+        let page = page.read();
         let data = page.get_row_data(col_offset, Size(mem::size_of::<Self>() as u16));
         let data: *const bool = data.as_ptr().cast();
         // SAFETY: We trust that the `row_ref` refers to a valid, initialized row,
@@ -206,6 +207,7 @@ macro_rules! impl_read_column_number {
                 let (page, offset) = row_ref.page_and_offset();
                 let col_offset = offset + PageOffset(layout.offset);
 
+                let page = page.read();
                 let data = page.get_row_data(col_offset, Size(mem::size_of::<Self>() as u16));
                 let data: Result<[u8; mem::size_of::<Self>()], _> = data.try_into();
                 // SAFETY: `<[u8; N] as TryFrom<&[u8]>` succeeds if and only if the slice's length is `N`.
@@ -248,6 +250,7 @@ unsafe impl ReadColumn for AlgebraicValue {
         let curr_offset = Cell::new(layout.offset as usize);
         let blob_store = row_ref.blob_store();
         let (page, page_offset) = row_ref.page_and_offset();
+        let page = page.read();
         let fixed_bytes = page.get_row_data(page_offset, row_ref.row_layout().size());
 
         // SAFETY:
@@ -255,7 +258,14 @@ unsafe impl ReadColumn for AlgebraicValue {
         // 2. As a result of the above, all `VarLenRef`s in the column are valid.
         // 3. Our requirements on `offset_in_bytes` mean that our `curr_offset` is valid.
         let res = unsafe {
-            bflatn_from::serialize_value(ValueSerializer, fixed_bytes, page, blob_store, &curr_offset, &layout.ty)
+            bflatn_from::serialize_value(
+                ValueSerializer,
+                fixed_bytes,
+                &page,
+                blob_store,
+                &curr_offset,
+                &layout.ty,
+            )
         };
 
         debug_assert!(res.is_ok());
@@ -354,6 +364,7 @@ unsafe impl ReadColumn for SumTag {
         let (page, offset) = row_ref.page_and_offset();
         let col_offset = offset + PageOffset(layout.offset);
 
+        let page = page.read();
         let data = page.get_row_data(col_offset, Size(1));
         let data: Result<[u8; 1], _> = data.try_into();
         // SAFETY: `<[u8; 1] as TryFrom<&[u8]>` succeeds if and only if the slice's length is `1`.

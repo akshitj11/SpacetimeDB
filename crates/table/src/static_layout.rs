@@ -650,21 +650,21 @@ mod test {
             };
 
             let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
-            let bytes = row_ref.get_row_data();
+            row_ref.with_row_data(|bytes| {
+                let slow_path = bsatn::to_vec(&row_ref).unwrap();
 
-            let slow_path = bsatn::to_vec(&row_ref).unwrap();
+                let fast_path = unsafe {
+                    static_layout.serialize_row_into_vec(bytes)
+                };
 
-            let fast_path = unsafe {
-                static_layout.serialize_row_into_vec(bytes)
-            };
+                let mut fast_path2 = Vec::new();
+                unsafe {
+                    static_layout.serialize_row_extend(&mut fast_path2, bytes)
+                };
 
-            let mut fast_path2 = Vec::new();
-            unsafe {
-                static_layout.serialize_row_extend(&mut fast_path2, bytes)
-            };
-
-            assert_eq!(slow_path, fast_path);
-            assert_eq!(slow_path, fast_path2);
+                assert_eq!(slow_path, fast_path);
+                assert_eq!(slow_path, fast_path2);
+            })
         }
 
         #[test]
@@ -679,14 +679,14 @@ mod test {
             let bsatn = bsatn::to_vec(&val).unwrap();
 
             let (_, row_ref) = table.insert(&mut blob_store, &val).unwrap();
-            let slow_path = row_ref.get_row_data();
+            row_ref.with_row_data(|slow_path| {
+                let mut fast_path = vec![0u8; slow_path.len()];
+                unsafe {
+                    static_layout.deserialize_row_into(&mut fast_path, &bsatn);
+                };
 
-            let mut fast_path = vec![0u8; slow_path.len()];
-            unsafe {
-                static_layout.deserialize_row_into(&mut fast_path, &bsatn);
-            };
-
-            assert_eq!(slow_path, fast_path);
+                assert_eq!(slow_path, fast_path);
+            })
         }
     }
 }

@@ -513,7 +513,7 @@ impl BflatnSerializedRowBuffer<'_> {
 }
 
 /// Counts the number of [`VarLenGranule`] allocations required to store `val` in a page.
-fn required_var_len_granules_for_row(val: &ProductValue) -> usize {
+pub fn required_var_len_granules_for_row(val: &ProductValue) -> usize {
     fn traverse_av(val: &AlgebraicValue, count: &mut usize) {
         match val {
             AlgebraicValue::Product(val) => traverse_product(val, count),

@@ -307,7 +307,6 @@ fn table_insert_one_row(c: &mut Criterion) {
         let val = black_box(val.to_product());
 
         // Insert before benching to alloc and fault in a page.
-        let pool = PagePool::new_for_test();
         let mut ctx = (table, NullBlobStore);
         let ptr = ctx.0.insert(&mut ctx.1, &val).unwrap().1.pointer();
         let pre = |_, (table, bs): &mut (Table, NullBlobStore)| {
@@ -359,7 +358,7 @@ fn table_delete_one_row(c: &mut Criterion) {
 
         // Insert before benching to alloc and fault in a page.
         let mut ctx = (table, NullBlobStore, PagePool::new_for_test());
-        let insert = |_: u64, (table, bs, pool): &mut (Table, NullBlobStore, PagePool)| {
+        let insert = |_: u64, (table, bs, _pool): &mut (Table, NullBlobStore, PagePool)| {
             table.insert(bs, &val).unwrap().1.pointer()
         };
 
@@ -407,7 +406,6 @@ fn table_extract_one_row(c: &mut Criterion) {
         let mut table = make_table_for_row_type::<R>(name);
         let val = val.to_product();
 
-        let pool = PagePool::new_for_test();
         let mut blob_store = NullBlobStore;
         let row = black_box(table.insert(&mut blob_store, &val).unwrap().1);
         group.bench_function(name, |b| {
@@ -554,7 +552,7 @@ fn powers<const N: usize>(ps: [u64; N]) -> [u64; N] {
 }
 
 fn insert_num_same<R: IndexedRow>(
-    pool: &PagePool,
+    _pool: &PagePool,
     tbl: &mut Table,
     mut make_row: impl FnMut() -> R,
     num_same: usize,
@@ -635,7 +633,7 @@ fn index_insert(c: &mut Criterion) {
                     insert_num_same(pool, tbl, || make_row(num_rows), num_same - 1);
                     make_row(num_rows).to_product()
                 };
-                iter_time_with(b, &mut ctx, pre, |row, _, (tbl, bs, pool)| {
+                iter_time_with(b, &mut ctx, pre, |row, _, (tbl, bs, _pool)| {
                     tbl.insert(bs, &row).map(|r| r.1.pointer())
                 });
             },

@@ -38,6 +38,7 @@ use spacetimedb_sats::{
     buffer::BufWriter,
     de::DeserializeOwned,
     i256,
+    layout::HasLayout,
     product_value::InvalidFieldError,
     satn::Satn,
     ser::{self, Serialize, Serializer},
@@ -1883,6 +1884,34 @@ impl Table {
     pub fn bytes_used_by_index_keys(&self) -> u64 {
         self.indexes.values().map(|idx| idx.num_key_bytes()).sum()
     }
+
+    pub fn prepare_commit(
+        &self,
+        deletes: impl IntoIterator<Item = RowPointer>,
+        inserts: impl IntoIterator<Item = ProductValue>,
+    ) -> Result<PreparedCommit, PageError> {
+        self.inner.pages.prepare_commit(
+            self.row_size(),
+            &self.inner.visitor_prog,
+            deletes,
+            inserts.into_iter().map(|row| {
+                let num_granules = self.required_var_len_granules_for_insert(&row);
+                (row, num_granules)
+            }),
+        )
+    }
+
+    fn required_var_len_granules_for_insert(&self, row: &ProductValue) -> usize {
+        if self.inner.row_layout.layout().fixed {
+            0
+        } else {
+            required_var_len_granules_for_row(row)
+        }
+    }
+
+    pub(crate) fn register(&mut self, reserved: ReservedPage) -> PageHandle {
+        self.inner.pages.register(reserved)
+    }
 }
 
 /// A reference to a single row within a table.
@@ -1891,6 +1920,7 @@ impl Table {
 ///
 /// Having a `r: RowRef` is a proof that [`r.pointer()`](RowRef::pointer) refers to a valid row.
 /// This makes constructing a `RowRef`, i.e., `RowRef::new`, an `unsafe` operation.
+#[derive(Clone)]
 pub struct RowRef<'a> {
     /// The table that has the row at `self.pointer`.
     table: &'a TableInner,
@@ -2079,14 +2109,15 @@ impl<'a> RowRef<'a> {
     }
 
     /// Returns the page the row is in and the offset of the row within that page.
-    pub fn page_and_offset(&self) -> (&Page, PageOffset) {
-        (&*self.page, self.pointer.page_offset())
+    pub fn page_and_offset(&self) -> (&PageHandle, PageOffset) {
+        (&self.page, self.pointer.page_offset())
     }
 
-    /// Returns the bytes for the fixed portion of this row.
-    pub(crate) fn get_row_data(&self) -> &Bytes {
+    /// Runs `f` with the bytes for the fixed portion of this row.
+    pub(crate) fn with_row_data<T>(&self, f: impl FnOnce(&Bytes) -> T) -> T {
         let (page, offset) = self.page_and_offset();
-        page.get_row_data(offset, self.table.row_layout.size())
+        let page = page.read();
+        f(page.get_row_data(offset, self.table.row_layout.size()))
     }
 
     /// Returns the row hash for `ptr`.
@@ -2116,8 +2147,9 @@ impl<'a> RowRef<'a> {
     /// as a row may contain multiple references to the same large blob.
     /// This seems unlikely to occur in practice.
     fn blob_store_bytes(&self) -> usize {
-        let row_data = self.get_row_data();
-        let (page, _) = self.page_and_offset();
+        let (page, offset) = self.page_and_offset();
+        let page = page.read();
+        let row_data = page.get_row_data(offset, self.table.row_layout.size());
         // SAFETY:
         // - Existence of a `RowRef` treated as proof
         //   of the row's validity and type information's correctness.
@@ -2133,6 +2165,14 @@ impl<'a> RowRef<'a> {
                 blob.len()
             })
             .sum()
+    }
+
+    pub fn with_page_mut<T>(&mut self, f: impl FnOnce(&mut Page) -> T) -> T {
+        self.page.with_page_mut(f)
+    }
+
+    pub fn into_page(self) -> PageHandle {
+        self.page
     }
 }
 
@@ -2156,11 +2196,12 @@ impl ToBsatn for RowRef<'_> {
     fn to_bsatn_vec(&self) -> Result<Vec<u8>, BsatnError> {
         if let Some(static_layout) = self.static_layout() {
             // Use fast path, by first fetching the row data and then using the static layout.
-            let row = self.get_row_data();
-            // SAFETY:
-            // - Existence of a `RowRef` treated as proof
-            //   of row's validity and type information's correctness.
-            Ok(unsafe { static_layout.serialize_row_into_vec(row) })
+            self.with_row_data(|row| {
+                // SAFETY:
+                // - Existence of a `RowRef` treated as proof
+                //   of row's validity and type information's correctness.
+                Ok(unsafe { static_layout.serialize_row_into_vec(row) })
+            })
         } else {
             bsatn::to_vec(self)
         }
@@ -2174,13 +2215,14 @@ impl ToBsatn for RowRef<'_> {
     fn to_bsatn_extend(&self, buf: &mut (impl BufWriter + BufReservedFill)) -> Result<(), BsatnError> {
         if let Some(static_layout) = self.static_layout() {
             // Use fast path, by first fetching the row data and then using the static layout.
-            let row = self.get_row_data();
-            // SAFETY:
-            // - Existence of a `RowRef` treated as proof
-            //   of row's validity and type information's correctness.
-            unsafe {
-                static_layout.serialize_row_extend(buf, row);
-            }
+            self.with_row_data(|row| {
+                // SAFETY:
+                // - Existence of a `RowRef` treated as proof
+                //   of row's validity and type information's correctness.
+                unsafe {
+                    static_layout.serialize_row_extend(buf, row);
+                }
+            });
             Ok(())
         } else {
             // Use the slower, but more general, `bsatn_from` serializer to write the row.
@@ -2211,7 +2253,7 @@ impl PartialEq for RowRef<'_> {
         let static_layout = self.static_layout();
         // SAFETY: `offset_a/b` are valid rows in `page_a/b` typed at `a_ty`
         // and `static_bsatn_layout` is derived from `a_ty`.
-        unsafe { eq_row_in_page(page_a, page_b, offset_a, offset_b, a_ty, static_layout) }
+        unsafe { eq_row_in_page(&page_a.read(), &page_b.read(), offset_a, offset_b, a_ty, static_layout) }
     }
 }
 
@@ -2221,7 +2263,7 @@ impl PartialEq<ProductValue> for RowRef<'_> {
         let (page, offset) = self.page_and_offset();
         // SAFETY: By having `RowRef`,
         // we know that `offset` is a valid offset for a row in `page` typed at `ty`.
-        unsafe { eq_row_in_page_to_pv(self.blob_store, page, offset, rhs, ty) }
+        unsafe { eq_row_in_page_to_pv(self.blob_store, &page.read(), offset, rhs, ty) }
     }
 }
 
@@ -2234,7 +2276,7 @@ impl Hash for RowRef<'_> {
         // 2. the row is valid for `ty`.
         // 3. for any `vlr: VarLenRef` stored in the row,
         //    `vlr.first_offset` is either `NULL` or points to a valid granule in `page`.
-        unsafe { hash_row_in_page(state, page, self.blob_store, offset, ty) };
+        unsafe { hash_row_in_page(state, &page.read(), self.blob_store, offset, ty) };
     }
 }
 
@@ -2762,6 +2804,7 @@ pub(crate) mod test {
                 .get_page(pi)
                 .expect("no page fault to occur")
                 .expect("reserved page to be present")
+                .read()
                 .unmodified_hash(),
             None
         );
@@ -3137,37 +3180,42 @@ pub(crate) mod test {
             next_value += 1;
         }
 
-        let first_page = table
-            .inner
-            .pages
-            .get_page(PageIndex(0))
-            .expect("no page faults")
-            .expect("page zero to be present after inserting many rows");
-        let second_page = table
-            .inner
-            .pages
-            .get_page(PageIndex(1))
-            .expect("no page faults")
-            .expect("page one to be present after inserting many rows");
-        assert!(first_page.is_full(table.row_size()));
-        assert_eq!(first_page.available_var_len_granules(), 0);
-        assert!(!second_page.is_full(table.row_size()));
-        assert!(second_page.available_var_len_granules() > 0);
-        drop(first_page);
-        drop(second_page);
+        {
+            let first_page = table
+                .inner
+                .pages
+                .get_page(PageIndex(0))
+                .expect("no page faults")
+                .expect("page zero to be present after inserting many rows");
+            let second_page = table
+                .inner
+                .pages
+                .get_page(PageIndex(1))
+                .expect("no page faults")
+                .expect("page one to be present after inserting many rows");
+
+            let first_page = first_page.read();
+            let second_page = second_page.read();
+            assert!(first_page.is_full(table.row_size()));
+            assert_eq!(first_page.available_var_len_granules(), 0);
+            assert!(!second_page.is_full(table.row_size()));
+            assert!(second_page.available_var_len_granules() > 0);
+        }
 
         let first_ptr = inserted_ptrs[0];
         table.delete(&mut blob_store, first_ptr, |_| ()).unwrap();
 
-        let first_page = table
-            .inner
-            .pages
-            .get_page(PageIndex(0))
-            .expect("no page faults")
-            .expect("page zero to still be present after a delete that does not empty it");
-        assert!(!first_page.is_full(table.row_size()));
-        assert_eq!(first_page.available_var_len_granules(), 0);
-        drop(first_page);
+        {
+            let first_page = table
+                .inner
+                .pages
+                .get_page(PageIndex(0))
+                .expect("no page faults")
+                .expect("page zero to still be present after a delete that does not empty it");
+            let first_page = first_page.read();
+            assert!(!first_page.is_full(table.row_size()));
+            assert_eq!(first_page.available_var_len_granules(), 0);
+        }
 
         let (_, row_ref) = table.insert(&mut blob_store, &product![next_value]).unwrap();
         let new_ptr = row_ref.pointer();
@@ -3180,6 +3228,7 @@ pub(crate) mod test {
             .get_page(PageIndex(0))
             .expect("no page faults")
             .expect("page zero to still be present after an insert");
+        let first_page = first_page.read();
         assert!(first_page.is_full(table.row_size()));
         assert_eq!(first_page.available_var_len_granules(), 0);
     }

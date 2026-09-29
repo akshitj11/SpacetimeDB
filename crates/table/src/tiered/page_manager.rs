@@ -134,6 +134,7 @@ impl PageSlotHandle {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub enum PageSlot {
     Absent,
     Resident {
@@ -277,6 +278,7 @@ impl PageFrame {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub enum ResidentPageState {
     Clean { hash: Option<blake3::Hash> },
     Dirty { hash: Option<blake3::Hash> },
@@ -499,6 +501,7 @@ impl FrameRegistry {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub struct FrameRegistryEntry {
     frame: Weak<PageFrame>,
     slot: Weak<Mutex<PageSlot>>,

@@ -1,6 +1,5 @@
 use super::{
     datastore::Result,
-    delete_table::DeleteTable,
     sequence::{Sequence, SequencesState},
     state_view::{MapPageErrors, StateView, TableScan},
     tx_state::{IndexIdMap, PendingSchemaChange, TxState},
@@ -8,7 +7,7 @@ use super::{
 };
 use crate::{
     db_metrics::DB_METRICS,
-    error::TableError,
+    error::{DatastoreError, TableError},
     execution_context::ExecutionContext,
     locking_tx_datastore::{
         mut_tx::{ViewInstanceState, ViewInstanceTxState, ViewReadSets},
@@ -52,7 +51,6 @@ use spacetimedb_table::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use thin_vec::ThinVec;
 
 /// Contains the live, in-memory snapshot of a database. This structure
 /// is exposed in order to support tools wanting to process the commit
@@ -569,22 +567,82 @@ impl CommittedState {
         let mut tx_data = TxData::default();
         let mut truncates = IntSet::default();
 
-        // First, apply deletes. This will free up space in the committed tables.
-        self.merge_apply_deletes(
-            &mut tx_data,
-            tx_state.delete_tables,
-            tx_state.pending_schema_changes,
-            &mut truncates,
-        )?;
+        let mut prepared: BTreeMap<TableId, PreparedCommit> = BTreeMap::new();
+        for (table_id, maybe_deletes, maybe_inserts) in tx_state.tx_tables() {
+            let mut table_and_blob_store = None;
 
-        // Then, apply inserts. This will re-fill the holes freed by deletions
-        // before allocating new pages.
-        self.merge_apply_inserts(
-            &mut tx_data,
-            tx_state.insert_tables,
-            tx_state.blob_store,
-            &mut truncates,
-        )?;
+            let deletes = match maybe_deletes {
+                None => Vec::new(),
+                Some(delete_table) if delete_table.is_empty() => Vec::new(),
+                Some(delete_table) => {
+                    let (table, blob_store, _) = self
+                        .get_table_and_blob_store(table_id)
+                        .expect("deletion for non-existent table");
+                    let mut deletes: Vec<RowPointer> = delete_table.iter().collect();
+                    for change in &tx_state.pending_schema_changes {
+                        if let PendingSchemaChange::TableRemoved(_, table) = change {
+                            let mut rows = table.scan_all_row_ptrs()?;
+                            deletes.append(&mut rows);
+                        }
+                    }
+                    table_and_blob_store = Some((table, blob_store));
+
+                    deletes
+                }
+            };
+
+            let inserts = match maybe_inserts {
+                None => Vec::new(),
+                Some(insert_table) => {
+                    if table_and_blob_store.is_none() {
+                        let (table, blob_store, _) =
+                            self.get_table_and_blob_store_or_create(table_id, insert_table.get_schema());
+                        table_and_blob_store = Some((table, blob_store));
+                    }
+                    insert_table
+                        .scan_rows(table_and_blob_store.unwrap().1)
+                        .map(|r| r.map(|row| row.to_product_value()).map_err(DatastoreError::from))
+                        .collect::<Result<Vec<_>>>()?
+                }
+            };
+
+            if let Some((table, _)) = table_and_blob_store {
+                let commit = table.prepare_commit(deletes, inserts.into_iter())?;
+                prepared.insert(table_id, commit);
+            }
+        }
+
+        // The transaction is now infallible. Apply it.
+        for (table_id, commit) in prepared {
+            let (table, blob_store, _, _) = self
+                .get_table_and_blob_store_mut(table_id)
+                .expect("table must have been created during prepare phase");
+            let page_bytes_before = table.page_bytes();
+
+            let (deletes, inserts) = commit.apply(table, blob_store).into_parts();
+            let table_name = &table.get_schema().table_name;
+
+            if !deletes.is_empty() {
+                tx_data.set_deletes_for_table(table_id, table_name, deletes);
+                let truncated = table.row_count == 0;
+                if truncated {
+                    truncates.insert(table_id);
+                }
+            }
+
+            if !inserts.is_empty() {
+                tx_data.set_inserts_for_table(table_id, table_name, inserts);
+                // If the table as inserted rows, it cannot be truncated.
+                // TODO(kim): This should not be possible anymore, because all
+                // deletes and inserts are already applied.
+                if truncates.contains(&table_id) {
+                    truncates.remove(&table_id);
+                }
+            }
+
+            let page_bytes_after = table.page_bytes();
+            self.add_datastore_page_bytes(page_bytes_after.saturating_sub(page_bytes_before));
+        }
 
         // Record any truncated tables in the `TxData`.
         tx_data.set_truncates(truncates);
@@ -613,168 +671,6 @@ impl CommittedState {
 
     fn merge_read_sets(&mut self, read_sets: ViewReadSets) {
         self.read_sets.merge(read_sets)
-    }
-
-    fn merge_apply_deletes(
-        &mut self,
-        tx_data: &mut TxData,
-        delete_tables: BTreeMap<TableId, DeleteTable>,
-        pending_schema_changes: ThinVec<PendingSchemaChange>,
-        truncates: &mut IntSet<TableId>,
-    ) -> Result<()> {
-        fn delete_rows(
-            tx_data: &mut TxData,
-            table_id: TableId,
-            table: &mut Table,
-            blob_store: &mut dyn BlobStore,
-            row_ptrs_len: usize,
-            row_ptrs: impl Iterator<Item = RowPointer>,
-            truncates: &mut IntSet<TableId>,
-        ) -> Result<()> {
-            let mut deletes = Vec::with_capacity(row_ptrs_len);
-
-            // Note: we maintain the invariant that the delete_tables
-            // holds only committed rows which should be deleted,
-            // i.e. `RowPointer`s with `SquashedOffset::COMMITTED_STATE`,
-            // so no need to check before applying the deletes.
-            for row_ptr in row_ptrs {
-                debug_assert!(row_ptr.squashed_offset().is_committed_state());
-
-                // TODO: re-write `TxData` to remove `ProductValue`s
-                let pv = table
-                    .delete(blob_store, row_ptr, |row| row.to_product_value())?
-                    .expect("Delete for non-existent row!");
-                deletes.push(pv);
-            }
-
-            if !deletes.is_empty() {
-                let table_name = &table.get_schema().table_name;
-                tx_data.set_deletes_for_table(table_id, table_name, deletes.into());
-                let truncated = table.row_count == 0;
-                if truncated {
-                    truncates.insert(table_id);
-                }
-            }
-            Ok(())
-        }
-
-        for (table_id, row_ptrs) in delete_tables {
-            match self.get_table_and_blob_store_mut(table_id) {
-                Ok((table, blob_store, ..)) => delete_rows(
-                    tx_data,
-                    table_id,
-                    table,
-                    blob_store,
-                    row_ptrs.len(),
-                    row_ptrs.iter(),
-                    truncates,
-                )?,
-                Err(_) if !row_ptrs.is_empty() => panic!("Deletion for non-existent table {table_id:?}... huh?"),
-                Err(_) => {}
-            }
-        }
-
-        // Delete all tables marked for deletion.
-        // The order here does not matter as once a `table_id` has been dropped
-        // it will never be re-created.
-        for change in pending_schema_changes {
-            if let PendingSchemaChange::TableRemoved(table_id, mut table) = change {
-                let row_ptrs = table.scan_all_row_ptrs()?;
-                truncates.insert(table_id);
-                delete_rows(
-                    tx_data,
-                    table_id,
-                    &mut table,
-                    &mut self.blob_store,
-                    row_ptrs.len(),
-                    row_ptrs.into_iter(),
-                    truncates,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn merge_apply_inserts(
-        &mut self,
-        tx_data: &mut TxData,
-        insert_tables: BTreeMap<TableId, Table>,
-        tx_bs: impl BlobStore,
-        truncates: &mut IntSet<TableId>,
-    ) -> Result<()> {
-        // TODO(perf): Consider moving whole pages from the `insert_tables` into the committed state,
-        //             rather than copying individual rows out of them.
-        //             This will require some magic to get the indexes right,
-        //             and may lead to a large number of mostly-empty pages in the committed state.
-        //             Likely we want to decide dynamically whether to move a page or copy its contents,
-        //             based on the available holes in the committed state
-        //             and the fullness of the page.
-
-        for (table_id, tx_table) in insert_tables {
-            let schema = tx_table.get_schema();
-            let page_pool = &self.page_pool;
-            if schema.is_event {
-                // For event tables, we don't want to insert into the committed state,
-                // we just want to include them in subscriptions and the commitlog.
-                Self::collect_inserts(page_pool, truncates, tx_data, &tx_bs, table_id, tx_table, |_| Ok(()))?;
-            } else {
-                let page_bytes_added = {
-                    let (commit_table, commit_blob_store, page_pool) =
-                        self.get_table_and_blob_store_or_create(table_id, schema);
-                    let page_bytes_before = commit_table.page_bytes();
-                    Self::collect_inserts(page_pool, truncates, tx_data, &tx_bs, table_id, tx_table, |row| {
-                        commit_table
-                            .insert(commit_blob_store, row)
-                            .map(drop)
-                            .map_err(Into::into)
-                    })?;
-                    let page_bytes_after = commit_table.page_bytes();
-                    debug_assert!(page_bytes_after >= page_bytes_before);
-                    page_bytes_after - page_bytes_before
-                };
-                self.add_datastore_page_bytes(page_bytes_added);
-            }
-        }
-        Ok(())
-    }
-
-    /// Collects the inserted rows in `tx_table` into `tx_data`,
-    /// and applies `on_row` to each inserted row.
-    ///
-    /// The `on_row` closure will be called with each inserted row.
-    /// `Self::merge_apply_inserts` uses this to add non-event rows to the committed state.
-    fn collect_inserts(
-        _page_pool: &PagePool,
-        truncates: &mut IntSet<TableId>,
-        tx_data: &mut TxData,
-        tx_blob_store: &impl BlobStore,
-        table_id: TableId,
-        tx_table: Table,
-        mut on_row: impl FnMut(&ProductValue) -> Result<()>,
-    ) -> Result<()> {
-        // For each newly-inserted row, serialize to a product value.
-        // This bypasses the `Vec<_>` intermediary and constructs the `Arc<[_]>` directly,
-        // which matters somewhat for smaller transactions and more for larger transactions.
-        let mut inserts = Arc::new_uninit_slice(tx_table.row_count as usize);
-        let inserts_mut = Arc::get_mut(&mut inserts).expect("`Arc` should be unique as it was just created");
-        for (row, slot) in tx_table.scan_rows(tx_blob_store).zip(inserts_mut) {
-            let row = row?.to_product_value();
-            on_row(&row)?;
-            slot.write(row);
-        }
-        // SAFETY: We've written to every slot in `inserts`, so it's now fully initialized.
-        let inserts = unsafe { inserts.assume_init() };
-
-        // Add the table to `TxData` if there were insertions.
-        if !inserts.is_empty() {
-            tx_data.set_inserts_for_table(table_id, &tx_table.get_schema().table_name, inserts);
-
-            // If table has inserted rows, it cannot be truncated.
-            if truncates.contains(&table_id) {
-                truncates.remove(&table_id);
-            }
-        }
-        Ok(())
     }
 
     /// Rolls back the changes immediately made to the committed state during a transaction.

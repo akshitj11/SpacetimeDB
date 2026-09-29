@@ -2622,14 +2622,13 @@ impl MutTxId {
     }
 
     pub fn row_level_security_for_table_id(&self, table_id: TableId) -> Result<Vec<RowLevelSecuritySchema>> {
-        Ok(self
-            .iter_by_col_eq(
-                ST_ROW_LEVEL_SECURITY_ID,
-                StRowLevelSecurityFields::TableId,
-                &table_id.into(),
-            )?
-            .map(|row| row.map(|row| StRowLevelSecurityRow::try_from(row).unwrap().into()))
-            .collect::<Result<_>>()?)
+        self.iter_by_col_eq(
+            ST_ROW_LEVEL_SECURITY_ID,
+            StRowLevelSecurityFields::TableId,
+            &table_id.into(),
+        )?
+        .map(|row| row.map(|row| StRowLevelSecurityRow::try_from(row).unwrap().into()))
+        .collect()
     }
 
     pub fn drop_row_level_security(&mut self, sql: RawSql) -> Result<()> {

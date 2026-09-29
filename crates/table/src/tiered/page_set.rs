@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use spacetimedb_lib::ProductValue;
 use spacetimedb_memory_usage::MemoryUsage;
 use spacetimedb_sats::layout::Size;
 
